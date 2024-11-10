@@ -14,6 +14,7 @@ import random
 import json
 from utils.system_utils import searchForMaxIteration
 from scene.dataset_readers import sceneLoadTypeCallbacks,GenerateRandomCameras,GeneratePurnCameras,GenerateCircleCameras
+from scene.dataset_readers_origin import sceneLoadTypeCallbacks_origin
 from scene.gaussian_model import GaussianModel
 from arguments import ModelParams, GenerateCamParams
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON, cameraList_from_RcamInfos
@@ -40,8 +41,16 @@ class Scene:
                 self.loaded_iter = load_iteration
             print("Loading trained model at iteration {}".format(self.loaded_iter))
 
+        self.train_cameras = {}
         self.test_cameras = {}
-        scene_info = sceneLoadTypeCallbacks["RandomCam"](self.model_path ,pose_args)
+
+        if os.path.exists(os.path.join(args._source_path, "sparse")):
+            scene_info = sceneLoadTypeCallbacks_origin["Colmap"](args._source_path, args._images, args._depths, args._qmasks, args.eval, args.train_test_exp)
+        elif os.path.exists(os.path.join(args._source_path, "transforms_train.json")):
+            print("Found transforms_train.json file, assuming Blender data set!")
+            scene_info = sceneLoadTypeCallbacks_origin["Blender"](args._source_path, args._white_background, args._depths, args.eval)
+        else:
+            assert False, "Could not recognize scene type!"
 
         json_cams = []
         camlist = []
@@ -53,17 +62,23 @@ class Scene:
             json.dump(json_cams, file)
 
         if shuffle:
+            random.shuffle(scene_info.train_cameras)  # Multi-res consistent random shuffling
             random.shuffle(scene_info.test_cameras)  # Multi-res consistent random shuffling
         self.cameras_extent = pose_args.default_radius #    scene_info.nerf_normalization["radius"]
+        
         for resolution_scale in resolution_scales:
-            self.test_cameras[resolution_scale] = cameraList_from_RcamInfos(scene_info.test_cameras, resolution_scale, self.pose_args)
+            print("Loading Training Cameras")
+            self.train_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.train_cameras, resolution_scale, args, scene_info.is_nerf_synthetic, False)
+            print("Loading Test Cameras")
+            self.test_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.test_cameras, resolution_scale, args, scene_info.is_nerf_synthetic, True)
+        
         if self.loaded_iter:
             self.gaussians.load_ply(os.path.join(self.model_path,
                                                            "point_cloud",
                                                            "iteration_" + str(self.loaded_iter),
                                                            "point_cloud.ply"))
-        elif self.pretrained_model_path is not None:
-            self.gaussians.load_ply(self.pretrained_model_path)
+        # elif self.pretrained_model_path is not None:
+        #     self.gaussians.load_ply(self.pretrained_model_path)
         else:
             self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent)
 
@@ -86,6 +101,8 @@ class Scene:
             train_cameras[resolution_scale] = cameraList_from_RcamInfos(rand_train_cameras, resolution_scale, self.pose_args)        
         return train_cameras[scale]
 
+    def getTrainCameras(self, scale=1.0):
+        return self.train_cameras[scale]
 
     def getTestCameras(self, scale=1.0):
         return self.test_cameras[scale]

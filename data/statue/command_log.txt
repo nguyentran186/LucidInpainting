@@ -1,0 +1,4 @@
+20201028_04:25:13 - colmap feature_extractor --ImageReader.camera_model PINHOLE --database_path /gcs/input/resized-llff-similar/qq11/database.db --image_path /gcs/output/resized-llff-similar/qq11/image --ImageReader.single_camera 1
+20201028_04:25:15 - colmap exhaustive_matcher --database_path /gcs/input/resized-llff-similar/qq11/database.db
+20201028_04:25:25 - colmap mapper --database_path /gcs/input/resized-llff-similar/qq11/database.db --image_path /gcs/output/resized-llff-similar/qq11/image --output_path /gcs/output/resized-llff-similar/qq11/sparse
+20201028_04:28:09 - colmap model_converter --input_path /gcs/output/resized-llff-similar/qq11/sparse/0 --output_path /gcs/output/resized-llff-similar/qq11/sparse --output_type TXT

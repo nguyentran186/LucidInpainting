@@ -111,14 +111,17 @@ class GuidanceParams(ParamGroup):
 
 class ModelParams(ParamGroup): 
     def __init__(self, parser, sentinel=False, opts=None):
-        self.sh_degree = 0
+        self.sh_degree = 3
         self._source_path = ""
         self._model_path = ""
         self.pretrained_model_path = None
         self._images = "images"
+        self._depths = ""
+        self._qmasks = "seg"
         self.workspace = "debug"
         self.batch = 10  
         self._resolution = -1
+        self.train_test_exp = False
         self._white_background = True
         self.data_device = "cuda"
         self.eval = False
@@ -132,6 +135,7 @@ class ModelParams(ParamGroup):
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
+        breakpoint()
         g = super().extract(args)
         g.source_path = os.path.abspath(g.source_path)
         return g
@@ -142,6 +146,7 @@ class PipelineParams(ParamGroup):
         self.convert_SHs_python = False
         self.compute_cov3D_python = False
         self.debug = False
+        self.antialiasing = False
         super().__init__(parser, "Pipeline Parameters")
 
 

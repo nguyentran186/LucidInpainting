@@ -1,6 +1,6 @@
 from audioop import mul
 from transformers import CLIPTextModel, CLIPTokenizer, logging
-from diffusers import StableDiffusionPipeline, DiffusionPipeline, DDPMScheduler, DDIMScheduler, EulerDiscreteScheduler, \
+from diffusers import StableDiffusionPipeline, StableDiffusionInpaintPipeline, DiffusionPipeline, DDPMScheduler, DDIMScheduler, EulerDiscreteScheduler, \
                       EulerAncestralDiscreteScheduler, DPMSolverMultistepScheduler, ControlNetModel, \
                       DDIMInverseScheduler, UNet2DConditionModel
 from diffusers.utils.import_utils import is_xformers_available
@@ -23,6 +23,82 @@ from torch.cuda.amp import custom_bwd, custom_fwd
 from .perpneg_utils import weighted_perpendicular_aggregator
 
 from .sd_step import *
+
+def prepare_mask_and_masked_image(image, mask):
+    if isinstance(image, torch.Tensor):
+        if not isinstance(mask, torch.Tensor):
+            raise TypeError(f"`image` is a torch.Tensor but `mask` (type: {type(mask)} is not")
+
+        # Batch single image
+        if image.ndim == 3:
+            assert image.shape[0] == 3, "Image outside a batch should be of shape (3, H, W)"
+            image = image.unsqueeze(0)
+
+        # Batch and add channel dim for single mask
+        if mask.ndim == 2:
+            mask = mask.unsqueeze(0).unsqueeze(0)
+
+        # Batch single mask or add channel dim
+        if mask.ndim == 3:
+            # Single batched mask, no channel dim or single mask not batched but channel dim
+            if mask.shape[0] == 1:
+                mask = mask.unsqueeze(0)
+
+            # Batched masks no channel dim
+            else:
+                mask = mask.unsqueeze(1)
+                
+        assert image.ndim == 4 and mask.ndim == 4, "Image and Mask must have 4 dimensions"
+        assert image.shape[-2:] == mask.shape[-2:], "Image and Mask must have the same spatial dimensions"
+        assert image.shape[0] == mask.shape[0], "Image and Mask must have the same batch size"
+
+        # Check image is in [-1, 1]
+        if image.min() < -1 or image.max() > 1:
+            raise ValueError("Image should be in [-1, 1] range")
+
+        # Check mask is in [0, 1]
+        if mask.min() < 0 or mask.max() > 1:
+            raise ValueError("Mask should be in [0, 1] range")
+
+        # Binarize mask
+        mask[mask < 0.5] = 0
+        mask[mask >= 0.5] = 1
+
+        # Image as float32
+        image = image.to(dtype=torch.float32)
+    elif isinstance(mask, torch.Tensor):
+        raise TypeError(f"`mask` is a torch.Tensor but `image` (type: {type(image)} is not")
+    else:
+        # preprocess image
+        if isinstance(image, (PIL.Image.Image, np.ndarray)):
+            image = [image]
+
+        if isinstance(image, list) and isinstance(image[0], PIL.Image.Image):
+            image = [np.array(i.convert("RGB"))[None, :] for i in image]
+            image = np.concatenate(image, axis=0)
+        elif isinstance(image, list) and isinstance(image[0], np.ndarray):
+            image = np.concatenate([i[None, :] for i in image], axis=0)
+
+        image = image.transpose(0, 3, 1, 2)
+        image = torch.from_numpy(image).to(dtype=torch.float32) / 127.5 - 1.0
+
+        # preprocess mask
+        if isinstance(mask, (PIL.Image.Image, np.ndarray)):
+            mask = [mask]
+
+        if isinstance(mask, list) and isinstance(mask[0], PIL.Image.Image):
+            mask = np.concatenate([np.array(m.convert("L"))[None, None, :] for m in mask], axis=0)
+            mask = mask.astype(np.float32) / 255.0
+        elif isinstance(mask, list) and isinstance(mask[0], np.ndarray):
+            mask = np.concatenate([m[None, None, :] for m in mask], axis=0)
+
+        mask[mask < 0.5] = 0
+        mask[mask >= 0.5] = 1
+        mask = torch.from_numpy(mask)
+
+    masked_image = image * (mask < 0.5)
+
+    return mask, masked_image
 
 def rgb2sat(img, T=None):
     max_ = torch.max(img, dim=1, keepdim=True).values + 1e-5
@@ -71,9 +147,9 @@ class StableDiffusion(nn.Module):
         base_model_key = "stabilityai/stable-diffusion-v1-5" if guidance_opt.base_model_key is None else guidance_opt.base_model_key # for finetuned model only
 
         if is_safe_tensor:
-            pipe = StableDiffusionPipeline.from_single_file(model_key, use_safetensors=True, torch_dtype=self.precision_t, load_safety_checker=False)
+            pipe = StableDiffusionInpaintPipeline.from_single_file(model_key, use_safetensors=True, torch_dtype=self.precision_t, load_safety_checker=False)
         else:
-            pipe = StableDiffusionPipeline.from_pretrained(model_key, torch_dtype=self.precision_t)
+            pipe = StableDiffusionInpaintPipeline.from_pretrained(model_key, torch_dtype=self.precision_t)
 
         self.ism = not guidance_opt.sds
         self.scheduler = DDIMScheduler.from_pretrained(model_key if not is_safe_tensor else base_model_key, subfolder="scheduler", torch_dtype=self.precision_t)
@@ -341,15 +417,66 @@ class StableDiffusion(nn.Module):
 
 
         return loss
+    
+    def prepare_mask_latents(
+        self, mask, masked_image, batch_size, height, width, dtype, device, generator, do_classifier_free_guidance
+    ):
+        # resize the mask to latents shape as we concatenate the mask to the latents
+        # we do that before converting to dtype to avoid breaking in case we're using cpu_offload
+        # and half precision
+        mask = torch.nn.functional.interpolate(
+            mask, size=(height // 8, width // 8)
+        )
+        mask = mask.to(device=device, dtype=dtype)
+
+        masked_image = masked_image.to(device=device, dtype=dtype)
+
+        # encode the mask image into latents space so we can concatenate it to the latents
+        if isinstance(generator, list):
+            masked_image_latents = [
+                self.vae.encode(masked_image[i : i + 1]).latent_dist.sample(generator=generator[i])
+                for i in range(batch_size)
+            ]
+            masked_image_latents = torch.cat(masked_image_latents, dim=0)
+        else:
+            masked_image_latents = self.vae.encode(masked_image).latent_dist.sample(generator=generator)
+        masked_image_latents = self.vae.config.scaling_factor * masked_image_latents
+
+        # duplicate mask and masked_image_latents for each generation per prompt, using mps friendly method
+        if mask.shape[0] < batch_size:
+            if not batch_size % mask.shape[0] == 0:
+                raise ValueError(
+                    "The passed mask and the required batch size don't match. Masks are supposed to be duplicated to"
+                    f" a total batch size of {batch_size}, but {mask.shape[0]} masks were passed. Make sure the number"
+                    " of masks that you pass is divisible by the total requested batch size."
+                )
+            mask = mask.repeat(batch_size // mask.shape[0], 1, 1, 1)
+        if masked_image_latents.shape[0] < batch_size:
+            if not batch_size % masked_image_latents.shape[0] == 0:
+                raise ValueError(
+                    "The passed images and the required batch size don't match. Images are supposed to be duplicated"
+                    f" to a total batch size of {batch_size}, but {masked_image_latents.shape[0]} images were passed."
+                    " Make sure the number of images that you pass is divisible by the total requested batch size."
+                )
+            masked_image_latents = masked_image_latents.repeat(batch_size // masked_image_latents.shape[0], 1, 1, 1)
+
+        mask = torch.cat([mask] * 2) if do_classifier_free_guidance else mask
+        masked_image_latents = (
+            torch.cat([masked_image_latents] * 2) if do_classifier_free_guidance else masked_image_latents
+        )
+
+        # aligning device to prevent device errors when concating it with the latent model input
+        masked_image_latents = masked_image_latents.to(device=device, dtype=dtype)
+        return mask, masked_image_latents
 
 
-    def train_step(self, text_embeddings, pred_rgb, pred_depth=None, pred_alpha=None,
+    def train_step(self, text_embeddings, pred_rgb, mask_image, pred_depth=None, pred_alpha=None,
                     grad_scale=1,use_control_net=False,
                     save_folder:Path=None, iteration=0, warm_up_rate = 0,
                     resolution=(512, 512), guidance_opt=None,as_latent=False, embedding_inverse = None):
 
-        pred_rgb, pred_depth, pred_alpha = self.augmentation(pred_rgb, pred_depth, pred_alpha)
-
+        # pred_rgb, pred_depth, pred_alpha = self.augmentation(pred_rgb, pred_depth, pred_alpha)
+        mask, masked_image = prepare_mask_and_masked_image(pred_rgb, mask_image)
         B = pred_rgb.shape[0]
         K = text_embeddings.shape[0] - 1
 
@@ -379,6 +506,31 @@ class StableDiffusion(nn.Module):
 
         ind_t = torch.randint(self.min_step, self.max_step + int(self.warmup_step*warm_up_rate), (1, ), dtype=torch.long, generator=self.noise_gen, device=self.device)[0]
         ind_prev_t = max(ind_t - current_delta_t, torch.ones_like(ind_t) * 0)
+        
+        mask, masked_image_latents = self.prepare_mask_latents(
+            mask,
+            masked_image,
+            latents.shape[0],
+            resolution[0] // 8,
+            resolution[1] // 8,
+            latents.dtype,
+            latents.device,
+            generator=self.noise_gen,
+            do_classifier_free_guidance=False,
+        )    
+        num_channels_latents = self.vae.config.latent_channels
+        
+        # Check that sizes of mask, masked image and latents match
+        num_channels_mask = mask.shape[1]
+        num_channels_masked_image = masked_image_latents.shape[1]
+        if num_channels_latents + num_channels_mask + num_channels_masked_image != self.unet.config.in_channels:
+            raise ValueError(
+                f"Incorrect configuration settings! The config of `pipeline.unet`: {self.unet.config} expects"
+                f" {self.unet.config.in_channels} but received `num_channels_latents`: {num_channels_latents} +"
+                f" `num_channels_mask`: {num_channels_mask} + `num_channels_masked_image`: {num_channels_masked_image}"
+                f" = {num_channels_latents+num_channels_masked_image+num_channels_mask}. Please verify the config of"
+                " `pipeline.unet` or your `mask_image` or `image` input."
+            )
 
         t = self.timesteps[ind_t]
         prev_t = self.timesteps[ind_prev_t]
@@ -410,20 +562,9 @@ class StableDiffusion(nn.Module):
             tt = t.reshape(1, 1).repeat(latent_model_input.shape[0], 1).reshape(-1)
 
             latent_model_input = self.scheduler.scale_model_input(latent_model_input, tt[0])
-            if use_control_net:
-                pred_depth_input = pred_depth_input[None, :, ...].repeat(1 + K, 1, 3, 1, 1).reshape(-1, 3, 512, 512).half()
-                down_block_res_samples, mid_block_res_sample = self.controlnet_depth(
-                    latent_model_input,
-                    tt,
-                    encoder_hidden_states=text_embeddings,
-                    controlnet_cond=pred_depth_input,
-                    return_dict=False,
-                )
-                unet_output = self.unet(latent_model_input, tt, encoder_hidden_states=text_embeddings,
-                                    down_block_additional_residuals=down_block_res_samples,
-                                    mid_block_additional_residual=mid_block_res_sample).sample
-            else:
-                unet_output = self.unet(latent_model_input.to(self.precision_t), tt.to(self.precision_t), encoder_hidden_states=text_embeddings.to(self.precision_t)).sample
+            latent_model_input = torch.cat([latent_model_input, mask, masked_image_latents], dim=1)
+
+            unet_output = self.unet(latent_model_input.to(self.precision_t), tt.to(self.precision_t), encoder_hidden_states=text_embeddings.to(self.precision_t)).sample
 
             unet_output = unet_output.reshape(2, -1, 4, resolution[0] // 8, resolution[1] // 8, )
             noise_pred_uncond, noise_pred_text = unet_output[:1].reshape(-1, 4, resolution[0] // 8, resolution[1] // 8, ), unet_output[1:].reshape(-1, 4, resolution[0] // 8, resolution[1] // 8, )

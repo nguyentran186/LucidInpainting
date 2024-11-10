@@ -9,20 +9,43 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
-from scene.cameras import Camera, RCamera
+from scene.cameras import RCamera
+from scene.cameras_origin import Camera
 import numpy as np
 from utils.general_utils import PILtoTorch
 from utils.graphics_utils import fov2focal
+from PIL import Image
+import cv2
 
 WARNED = False
 
-def loadCam(args, id, cam_info, resolution_scale):
-    orig_w, orig_h = cam_info.image.size
+def loadCam(args, id, cam_info, resolution_scale, is_nerf_synthetic, is_test_dataset):
+    image = Image.open(cam_info.image_path)
+    mask = Image.open(cam_info.mask_path)
+    if cam_info.depth_path != "":
+        try:
+            if is_nerf_synthetic:
+                invdepthmap = cv2.imread(cam_info.depth_path, -1).astype(np.float32) / 512
+            else:
+                invdepthmap = cv2.imread(cam_info.depth_path, -1).astype(np.float32) / float(2**16)
 
-    if args.resolution in [1, 2, 4, 8]:
-        resolution = round(orig_w/(resolution_scale * args.resolution)), round(orig_h/(resolution_scale * args.resolution))
+        except FileNotFoundError:
+            print(f"Error: The depth file at path '{cam_info.depth_path}' was not found.")
+            raise
+        except IOError:
+            print(f"Error: Unable to open the image file '{cam_info.depth_path}'. It may be corrupted or an unsupported format.")
+            raise
+        except Exception as e:
+            print(f"An unexpected error occurred when trying to read depth at {cam_info.depth_path}: {e}")
+            raise
+    else:
+        invdepthmap = None
+        
+    orig_w, orig_h = image.size
+    if args._resolution in [1, 2, 4, 8]:
+        resolution = round(orig_w/(resolution_scale * args._resolution)), round(orig_h/(resolution_scale * args._resolution))
     else:  # should be a type that converts to float
-        if args.resolution == -1:
+        if args._resolution == -1:
             if orig_w > 1600:
                 global WARNED
                 if not WARNED:
@@ -33,23 +56,17 @@ def loadCam(args, id, cam_info, resolution_scale):
             else:
                 global_down = 1
         else:
-            global_down = orig_w / args.resolution
+            global_down = orig_w / args._resolution
+    
 
         scale = float(global_down) * float(resolution_scale)
         resolution = (int(orig_w / scale), int(orig_h / scale))
 
-    resized_image_rgb = PILtoTorch(cam_info.image, resolution)
-
-    gt_image = resized_image_rgb[:3, ...]
-    loaded_mask = None
-
-    if resized_image_rgb.shape[1] == 4:
-        loaded_mask = resized_image_rgb[3:4, ...]
-
-    return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
-                  FoVx=cam_info.FovX, FoVy=cam_info.FovY, 
-                  image=gt_image, gt_alpha_mask=loaded_mask,
-                  image_name=cam_info.image_name, uid=id, data_device=args.data_device)
+    return Camera(resolution, colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
+                  FoVx=cam_info.FovX, FoVy=cam_info.FovY, depth_params=cam_info.depth_params,
+                  image=image, invdepthmap=invdepthmap, mask=mask,
+                  image_name=cam_info.image_name, uid=id, data_device=args.data_device,
+                  train_test_exp=args.train_test_exp, is_test_dataset=is_test_dataset, is_test_view=cam_info.is_test)
 
 
 def loadRandomCam(opt, id, cam_info, resolution_scale, SSAA=False):
@@ -58,11 +75,11 @@ def loadRandomCam(opt, id, cam_info, resolution_scale, SSAA=False):
                   delta_azimuth=cam_info.delta_azimuth , delta_radius=cam_info.delta_radius, opt=opt, 
                   uid=id, data_device=opt.device, SSAA=SSAA)
 
-def cameraList_from_camInfos(cam_infos, resolution_scale, args):
+def cameraList_from_camInfos(cam_infos, resolution_scale, args, is_nerf_synthetic, is_test_dataset):
     camera_list = []
 
     for id, c in enumerate(cam_infos):
-        camera_list.append(loadCam(args, id, c, resolution_scale))
+        camera_list.append(loadCam(args, id, c, resolution_scale, is_nerf_synthetic, is_test_dataset))
 
     return camera_list
 

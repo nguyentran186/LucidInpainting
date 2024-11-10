@@ -1,0 +1,2 @@
+20201028_04:25:13 - /gcs/input/resized-llff-similar/qq11: STARTED
+20201028_04:28:09 - /gcs/output/resized-llff-similar/qq11: Succeeded.
