@@ -207,10 +207,9 @@ def training(dataset, opt, pipe, gcams, guidance_opt, testing_iterations, saving
         if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras().copy()
             viewpoint_indices = list(range(len(viewpoint_stack)))       
-        
         rand_idx = randint(0, len(viewpoint_indices) - 1)
         viewpoint_cam = viewpoint_stack.pop(rand_idx)
-        vind = viewpoint_indices.pop(rand_idx)
+        _ = viewpoint_indices.pop(rand_idx)
 
         C_batch_size = guidance_opt.C_batch_size
         viewpoint_cams = []
@@ -226,11 +225,14 @@ def training(dataset, opt, pipe, gcams, guidance_opt, testing_iterations, saving
         text_z_inverse =torch.cat([embeddings['uncond'],embeddings['inverse_text']], dim=0)
 
         for i in range(C_batch_size):
-            try:
-                viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))            
-            except:
-                viewpoint_stack = scene.getRandTrainCameras().copy()
-                viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
+            # random_int = randint(0, len(viewpoint_stack)-1)
+            # try:
+            #     viewpoint_cam = viewpoint_stack.pop(random_int)            
+            #     _ = viewpoint_indices.pop(random_int)
+            # except:
+            #     viewpoint_stack = scene.getRandTrainCameras().copy()
+            #     viewpoint_cam = viewpoint_stack.pop(random_int)
+            #     _ = viewpoint_indices.pop(random_int)
                 
             mask_image = viewpoint_cam.mask_image
                 

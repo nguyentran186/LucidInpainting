@@ -232,7 +232,7 @@ class StableDiffusion(nn.Module):
             cur_c += channels[i]
         return (ten for ten in results)
 
-    def add_noise_with_cfg(self, latents, noise, 
+    def add_noise_with_cfg(self, latents, mask, mask_img, noise, 
                            ind_t, ind_prev_t, 
                            text_embeddings=None, cfg=1.0, 
                            delta_t=1, inv_steps=1,
@@ -244,7 +244,6 @@ class StableDiffusion(nn.Module):
             uncond_text_embedding = text_embeddings.reshape(2, -1, text_embeddings.shape[-2], text_embeddings.shape[-1])[1]
 
         unet = self.unet
-
         if is_noisy_latent:
             prev_noisy_lat = latents
         else:
@@ -269,6 +268,7 @@ class StableDiffusion(nn.Module):
                 
                 unet_output = cond + cfg * (uncond - cond) # reverse cfg to enhance the distillation
             else:
+                cur_noisy_lat_ = torch.cat([cur_noisy_lat_, mask, mask_img], dim=1)
                 timestep_model_input = self.timesteps[cur_ind_t].reshape(1, 1).repeat(cur_noisy_lat_.shape[0], 1).reshape(-1)
                 unet_output = unet(cur_noisy_lat_, timestep_model_input, 
                                     encoder_hidden_states=uncond_text_embedding).sample
@@ -425,7 +425,7 @@ class StableDiffusion(nn.Module):
         # we do that before converting to dtype to avoid breaking in case we're using cpu_offload
         # and half precision
         mask = torch.nn.functional.interpolate(
-            mask, size=(height // 8, width // 8)
+            mask, size=(height, width)
         )
         mask = mask.to(device=device, dtype=dtype)
 
@@ -547,10 +547,10 @@ class StableDiffusion(nn.Module):
                 xs_inv_steps = guidance_opt.xs_inv_steps if guidance_opt.xs_inv_steps is not None else int(np.ceil(ind_prev_t / xs_delta_t))
                 starting_ind = max(ind_prev_t - xs_delta_t * xs_inv_steps, torch.ones_like(ind_t) * 0)
 
-                _, prev_latents_noisy, pred_scores_xs = self.add_noise_with_cfg(latents, noise, ind_prev_t, starting_ind, inverse_text_embeddings, 
+                _, prev_latents_noisy, pred_scores_xs = self.add_noise_with_cfg(latents, mask, masked_image_latents, noise, ind_prev_t, starting_ind, inverse_text_embeddings, 
                                                                                 guidance_opt.denoise_guidance_scale, xs_delta_t, xs_inv_steps, eta=guidance_opt.xs_eta)
                 # Step 2: sample x_t
-                _, latents_noisy, pred_scores_xt = self.add_noise_with_cfg(prev_latents_noisy, noise, ind_t, ind_prev_t, inverse_text_embeddings, 
+                _, latents_noisy, pred_scores_xt = self.add_noise_with_cfg(prev_latents_noisy, mask, masked_image_latents, noise, ind_t, ind_prev_t, inverse_text_embeddings, 
                                                                            guidance_opt.denoise_guidance_scale, current_delta_t, 1, is_noisy_latent=True)        
 
                 pred_scores = pred_scores_xt + pred_scores_xs
@@ -559,6 +559,8 @@ class StableDiffusion(nn.Module):
 
         with torch.no_grad():
             latent_model_input = latents_noisy[None, :, ...].repeat(2, 1, 1, 1, 1).reshape(-1, 4, resolution[0] // 8, resolution[1] // 8, )
+            mask = mask.repeat(2, 1, 1, 1)
+            masked_image_latents = masked_image_latents.repeat(2, 1, 1, 1)
             tt = t.reshape(1, 1).repeat(latent_model_input.shape[0], 1).reshape(-1)
 
             latent_model_input = self.scheduler.scale_model_input(latent_model_input, tt[0])
