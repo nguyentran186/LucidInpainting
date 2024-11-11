@@ -28,6 +28,7 @@ from arguments import ModelParams, PipelineParams, OptimizationParams, GenerateC
 import math
 from torchvision.utils import save_image
 import torchvision.transforms as T
+from PIL import Image
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -168,14 +169,6 @@ def training(dataset, opt, pipe, gcams, guidance_opt, testing_iterations, saving
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
 
-    if opt.save_process:
-        save_folder_proc = os.path.join(scene.args._model_path,"process_videos/")
-        if not os.path.exists(save_folder_proc):
-            os.makedirs(save_folder_proc)  # makedirs
-        process_view_points = scene.getCircleVideoCameras(batch_size=opt.pro_frames_num,render45=opt.pro_render_45).copy()    
-        save_process_iter = opt.iterations // len(process_view_points)
-        pro_img_frames = []
-
     for iteration in range(first_iter, opt.iterations + 1):        
         #TODO: DEBUG NETWORK_GUI
         if network_gui.conn == None:
@@ -211,7 +204,6 @@ def training(dataset, opt, pipe, gcams, guidance_opt, testing_iterations, saving
         viewpoint_cam = viewpoint_stack.pop(rand_idx)
         _ = viewpoint_indices.pop(rand_idx)
 
-        C_batch_size = guidance_opt.C_batch_size
         viewpoint_cams = []
         images = []
         mask_images = []
@@ -223,80 +215,85 @@ def training(dataset, opt, pipe, gcams, guidance_opt, testing_iterations, saving
 
         # Embedding negative prompt
         text_z_inverse =torch.cat([embeddings['uncond'],embeddings['inverse_text']], dim=0)
-
-        for i in range(C_batch_size):
-            # random_int = randint(0, len(viewpoint_stack)-1)
-            # try:
-            #     viewpoint_cam = viewpoint_stack.pop(random_int)            
-            #     _ = viewpoint_indices.pop(random_int)
-            # except:
-            #     viewpoint_stack = scene.getRandTrainCameras().copy()
-            #     viewpoint_cam = viewpoint_stack.pop(random_int)
-            #     _ = viewpoint_indices.pop(random_int)
                 
-            mask_image = viewpoint_cam.mask_image
-                
-            #pred text_z
-            text_z = [embeddings['uncond']]
-            text_z.append(embeddings['default'])
-
-            text_z = torch.cat(text_z, dim=0)
-            text_z_.append(text_z)
-
-            # Render
-            if (iteration - 1) == debug_from:
-                pipe.debug = True
-            render_pkg = render(viewpoint_cam, gaussians, pipe, background, 
-                                sh_deg_aug_ratio = dataset.sh_deg_aug_ratio, 
-                                bg_aug_ratio = dataset.bg_aug_ratio, 
-                                shs_aug_ratio = dataset.shs_aug_ratio, 
-                                scale_aug_ratio = dataset.scale_aug_ratio)
+        mask_image = viewpoint_cam.mask_image.detach()
             
-            image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
-            depth, alpha = render_pkg["depth"], render_pkg["alpha"]
+        #pred text_z
+        text_z = [embeddings['uncond']]
+        text_z.append(embeddings['default'])
 
-            scales.append(render_pkg["scales"])
-            images.append(image)
-            depths.append(depth)
-            alphas.append(alpha)
-            mask_images.append(mask_image)
-            viewpoint_cams.append(viewpoint_cams)
+        text_z = torch.cat(text_z, dim=0)
+        text_z_.append(text_z)
+
+        # Render
+        if (iteration - 1) == debug_from:
+            pipe.debug = True
+        render_pkg = render(viewpoint_cam, gaussians, pipe, background, 
+                            sh_deg_aug_ratio = dataset.sh_deg_aug_ratio, 
+                            bg_aug_ratio = dataset.bg_aug_ratio, 
+                            shs_aug_ratio = dataset.shs_aug_ratio, 
+                            scale_aug_ratio = dataset.scale_aug_ratio)
+        
+        image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+        depth, alpha = render_pkg["depth"], render_pkg["alpha"]
+        
+        if iteration % 10 == 0:
+            # Convert tensor to PIL image
+            to_pil = T.ToPILImage()
+            pil_image = to_pil(image)
+
+            # Save the image
+            pil_image.save("temp.png")
+
+        scales.append(render_pkg["scales"])
+        images.append(torch.clamp(image, min=0.0, max=1.0))
+        depths.append(depth)
+        alphas.append(alpha)
+        mask_images.append(mask_image)
+        viewpoint_cams.append(viewpoint_cams)
 
         images = torch.stack(images, dim=0)
         depths = torch.stack(depths, dim=0)
         alphas = torch.stack(alphas, dim=0)
         mask_images = torch.stack(mask_images, dim=0)
+        loss_inpaint = None
         # Loss
-        warm_up_rate = 1. - min(iteration/opt.warmup_iter,1.)
-        guidance_scale = guidance_opt.guidance_scale
-        loss = guidance.train_step(torch.stack(text_z_, dim=1), images, mask_images,
-                                pred_depth=depths, pred_alpha=alphas,
-                                grad_scale=guidance_opt.lambda_guidance,
-                                use_control_net = use_control_net ,save_folder = save_folder,  iteration = iteration, warm_up_rate=warm_up_rate, 
-                                resolution=(gcams.image_h, gcams.image_w),
-                                guidance_opt=guidance_opt,as_latent=False, embedding_inverse = text_z_inverse)
-        #raise ValueError(f'original version not supported.')
-        scales = torch.stack(scales, dim=0)
+        if iteration > opt.inpaint_from:
+            warm_up_rate = 1. - min(iteration/opt.warmup_iter,1.)
+            guidance_scale = guidance_opt.guidance_scale
+            loss = guidance.train_step(torch.stack(text_z_, dim=1), images, mask_images,
+                                    pred_depth=depths, pred_alpha=alphas,
+                                    grad_scale=guidance_opt.lambda_guidance,
+                                    use_control_net = use_control_net ,save_folder = save_folder,  iteration = iteration, warm_up_rate=warm_up_rate, 
+                                    resolution=(gcams.image_h, gcams.image_w),
+                                    guidance_opt=guidance_opt,as_latent=False, embedding_inverse = text_z_inverse)
+            #raise ValueError(f'original version not supported.')
+            scales = torch.stack(scales, dim=0)
 
-        loss_scale = torch.mean(scales,dim=-1).mean()
-        loss_tv = tv_loss(images) + tv_loss(depths) 
-        # loss_bin = torch.mean(torch.min(alphas - 0.0001, 1 - alphas))
+            # Loss Inpaint
+            loss_scale = torch.mean(scales,dim=-1).mean()
+            loss_tv = tv_loss(images) + tv_loss(depths) 
+            # loss_bin = torch.mean(torch.min(alphas - 0.0001, 1 - alphas))
 
-        loss = loss + opt.lambda_tv * loss_tv + opt.lambda_scale * loss_scale #opt.lambda_tv * loss_tv + opt.lambda_bin * loss_bin + opt.lambda_scale * loss_scale +
+            loss_inpaint = loss + opt.lambda_tv * loss_tv + opt.lambda_scale * loss_scale #opt.lambda_tv * loss_tv + opt.lambda_bin * loss_bin + opt.lambda_scale * loss_scale +
+
+        # Loss RGB
+        invert_mask = 1 - mask_image
+        
+        gt_image = viewpoint_cam.original_image.cuda() 
+        Ll1 = l1_loss(image * invert_mask, gt_image * invert_mask)
+        ssim_value = ssim(image * invert_mask, gt_image * invert_mask)
+        loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
+        
+        if loss_inpaint is not None:
+            loss = loss + loss_inpaint.squeeze()/12
+        
         loss.backward()
         iter_end.record()
 
         with torch.no_grad():
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
-            if opt.save_process:
-                if iteration % save_process_iter == 0 and len(process_view_points) > 0:
-                    viewpoint_cam_p = process_view_points.pop(0)
-                    render_p = render(viewpoint_cam_p, gaussians, pipe, background, test=True)
-                    img_p = torch.clamp(render_p["render"], 0.0, 1.0) 
-                    img_p = img_p.detach().cpu().permute(1,2,0).numpy()
-                    img_p = (img_p * 255).round().astype('uint8')
-                    pro_img_frames.append(img_p)  
 
             if iteration % 10 == 0:
                 progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
@@ -306,10 +303,6 @@ def training(dataset, opt, pipe, gcams, guidance_opt, testing_iterations, saving
 
             # Log and save
             training_report(tb_writer, iteration, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
-            if (iteration in testing_iterations):
-                if save_video:
-                    video_inference(iteration, scene, render, (pipe, background))
-
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -335,9 +328,7 @@ def training(dataset, opt, pipe, gcams, guidance_opt, testing_iterations, saving
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene._model_path + "/chkpnt" + str(iteration) + ".pth")
-
-    if opt.save_process:
-        imageio.mimwrite(os.path.join(save_folder_proc, "video_rgb.mp4"), pro_img_frames, fps=30, quality=8)
+        
 
 
 
@@ -482,7 +473,7 @@ if __name__ == "__main__":
         gcp.device = args.device
 
     # save iterations
-    test_iter = [1] + [k * op.iterations // args.test_ratio for k in range(1, args.test_ratio)] + [op.iterations]
+    test_iter = [1] + [200] + [k * op.iterations // args.test_ratio for k in range(1, args.test_ratio)] + [op.iterations]
     args.test_iterations = test_iter
 
     save_iter = [k * op.iterations // args.save_ratio for k in range(1, args.save_ratio)] + [op.iterations]

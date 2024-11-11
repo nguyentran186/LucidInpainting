@@ -9,12 +9,13 @@ ModelParams:
   sh_degree: 0
   bg_aug_ratio: 0.66
   _source_path: 'data/statue'
+  _model_path: 'out/statue'
 
   
 
 GuidanceParams:
   model_key: 'runwayml/stable-diffusion-inpainting'
-  text: 'a DSLR photo of a bagel filled with cream cheese and lox.'
+  text: 'A Monkey'
   negative: 'unrealistic, blurry, low quality, out of focus, ugly, low contrast, dull, dark, low-resolution, oversaturation.'
   inverse_text: ''
   perpneg: false
@@ -30,7 +31,7 @@ GuidanceParams:
   annealing_intervals: true
 
   xs_delta_t: 200
-  xs_inv_steps: 5
+  xs_inv_steps: 1
   xs_eta: 0.0
   
   delta_t: 80
@@ -70,7 +71,8 @@ OptimizationParams:
   percent_dense: 0.003
   densify_grad_threshold: 0.00075
   progressive_view_iter: 500 #1500
-  opacity_reset_interval: 300 #500
+  opacity_reset_interval: 3000 #500
+  inpaint_from: 500
 
   scale_up_cameras_iter: 500
   fovy_scale_up_factor: [0.75, 1.1]

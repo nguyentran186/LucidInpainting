@@ -21,13 +21,51 @@ def inverse_sigmoid(x):
 def inverse_sigmoid_np(x):
     return np.log(x/(1-x))
 
-def PILtoTorch(pil_image, resolution):
+def dilate_mask(mask: torch.Tensor, kernel_size: int = 10, iterations: int = 1) -> torch.Tensor:
+    """
+    Dilate a torch tensor mask using a square kernel.
+
+    Parameters:
+        mask (torch.Tensor): The input mask tensor of shape (1, H, W).
+        kernel_size (int): The size of the dilation kernel (should be odd, e.g., 3, 5, 7).
+        iterations (int): The number of times dilation is applied.
+
+    Returns:
+        torch.Tensor: The dilated mask tensor of the same shape as input.
+    """
+    # Create a square kernel for dilation
+    kernel = torch.ones((1, 1, kernel_size, kernel_size), dtype=mask.dtype, device=mask.device)
+
+    # Dilation operation
+    for _ in range(iterations):
+        mask = F.conv2d(mask.float(), kernel, padding=kernel_size // 2)
+        mask = (mask > 0).float()  # Threshold to obtain binary mask again
+
+    return mask
+
+def PILtoTorch(pil_image, resolution, mask=False, kernel_size=3, iterations=1):
+    # Resize the PIL image
     resized_image_PIL = pil_image.resize(resolution)
+    
+    # Convert the PIL image to a Torch tensor
     resized_image = torch.from_numpy(np.array(resized_image_PIL)) / 255.0
+    
+    # Check if the image has 3 channels (RGB) or 1 channel (grayscale)
     if len(resized_image.shape) == 3:
-        return resized_image.permute(2, 0, 1)
+        # For RGB images
+        image_tensor = resized_image.permute(2, 0, 1)
     else:
-        return resized_image.unsqueeze(dim=-1).permute(2, 0, 1)
+        # For grayscale images
+        image_tensor = resized_image.unsqueeze(dim=-1).permute(2, 0, 1)
+
+    # If the mask flag is True, apply dilation
+    if mask:
+        # Convert image to binary mask (0s and 1s)
+        mask_tensor = (image_tensor > 0.5).float()  # Assume non-zero values are part of the mask
+        dilated_mask = dilate_mask(mask_tensor, kernel_size=kernel_size, iterations=iterations)
+        return dilated_mask  # Return the dilated mask
+    
+    return image_tensor  # Return the original image tensor
 
 def get_expon_lr_func(
     lr_init, lr_final, lr_delay_steps=0, lr_delay_mult=1.0, max_steps=1000000

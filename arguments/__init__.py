@@ -122,7 +122,7 @@ class ModelParams(ParamGroup):
         self.batch = 10  
         self._resolution = -1
         self.train_test_exp = False
-        self._white_background = True
+        self._white_background = False
         self.data_device = "cuda"
         self.eval = False
         self.opt_path = None
@@ -152,6 +152,7 @@ class PipelineParams(ParamGroup):
 
 class OptimizationParams(ParamGroup):
     def __init__(self, parser, opts=None):
+        self.inpaint_from = 0
         self.iterations = 5000# 10_000
         self.position_lr_init = 0.00016
         self.position_lr_final = 0.0000016
@@ -177,7 +178,7 @@ class OptimizationParams(ParamGroup):
         self.scaling_lr_final = 0.001
         self.rotation_lr_final = 0.0002
 
-        self.percent_dense = 0.003
+        self.percent_dense = 0.01
         self.densify_grad_threshold = 0.00075
 
         self.lambda_tv = 1.0 # 0.1
@@ -185,10 +186,11 @@ class OptimizationParams(ParamGroup):
         self.lambda_scale = 1.0
         self.lambda_sat = 1.0
         self.lambda_radius = 1.0
+        self.lambda_dssim = 0.2
         self.densification_interval = 100
-        self.opacity_reset_interval = 300
+        self.opacity_reset_interval = 3000
         self.densify_from_iter = 100
-        self.densify_until_iter = 30_00 
+        self.densify_until_iter = 30_000
         
         self.use_control_net_iter = 10000000 
         self.warmup_iter = 1500 
