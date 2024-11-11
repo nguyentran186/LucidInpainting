@@ -467,11 +467,11 @@ class StableDiffusion(nn.Module):
         masked_grad = grad * mask.chunk(2)[0]  # Use the mask chunk for the input batch
 
         # Scale gradients as needed, and handle NaN values
-        masked_grad = torch.nan_to_num(grad_scale * masked_grad)
+        grad = torch.nan_to_num(grad_scale * grad)
 
         # Create the loss with SpecifyGradient but only apply masked_grad
         # This will effectively ignore non-masked regions in backpropagation
-        loss = SpecifyGradient.apply(latents, masked_grad)
+        loss = SpecifyGradient.apply(latents, grad)
 
         return loss
 
