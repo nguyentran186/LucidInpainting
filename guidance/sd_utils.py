@@ -258,21 +258,16 @@ class StableDiffusion(nn.Module):
             # pred noise
             cur_noisy_lat_ = self.scheduler.scale_model_input(cur_noisy_lat, self.timesteps[cur_ind_t]).to(self.precision_t)
             
-            if cfg > 1.0:
-                latent_model_input = torch.cat([cur_noisy_lat_, cur_noisy_lat_])
-                timestep_model_input = self.timesteps[cur_ind_t].reshape(1, 1).repeat(latent_model_input.shape[0], 1).reshape(-1)
-                unet_output = unet(latent_model_input, timestep_model_input, 
-                                encoder_hidden_states=text_embeddings).sample
-                
-                uncond, cond = torch.chunk(unet_output, chunks=2)
-                
-                unet_output = cond + cfg * (uncond - cond) # reverse cfg to enhance the distillation
-            else:
+            if unet.config.in_channels == 9:
                 cur_noisy_lat_ = torch.cat([cur_noisy_lat_, mask, mask_img], dim=1)
                 timestep_model_input = self.timesteps[cur_ind_t].reshape(1, 1).repeat(cur_noisy_lat_.shape[0], 1).reshape(-1)
                 unet_output = unet(cur_noisy_lat_, timestep_model_input, 
                                     encoder_hidden_states=uncond_text_embedding).sample
-
+            else:
+                timestep_model_input = self.timesteps[cur_ind_t].reshape(1, 1).repeat(cur_noisy_lat_.shape[0], 1).reshape(-1)
+                unet_output = unet(cur_noisy_lat_, timestep_model_input, 
+                                    encoder_hidden_states=uncond_text_embedding).sample
+                
             pred_scores.append((cur_ind_t, unet_output))
 
             next_ind_t = min(cur_ind_t + delta_t, ind_t)
@@ -353,16 +348,18 @@ class StableDiffusion(nn.Module):
                     grad_scale=1,use_control_net=False,
                     save_folder:Path=None, iteration=0, warm_up_rate = 0,
                     resolution=(512, 512), guidance_opt=None,as_latent=False, embedding_inverse = None):
-
+        origin = (pred_rgb * (1-mask_image)).detach()
+        masked_pred_rgb = pred_rgb * mask_image.clone() + origin
+        
         # pred_rgb, pred_depth, pred_alpha = self.augmentation(pred_rgb, pred_depth, pred_alpha)
-        mask, masked_image = prepare_mask_and_masked_image(pred_rgb, mask_image)
-        B = pred_rgb.shape[0]
+        mask, masked_image = prepare_mask_and_masked_image(masked_pred_rgb, mask_image)
+        B = masked_pred_rgb.shape[0]
         K = text_embeddings.shape[0] - 1
 
         if as_latent:      
             latents,_ = self.encode_imgs(pred_depth.repeat(1,3,1,1).to(self.precision_t))
         else:
-            latents,_ = self.encode_imgs(pred_rgb.to(self.precision_t))
+            latents,_ = self.encode_imgs(masked_pred_rgb.to(self.precision_t))
         # timestep ~ U(0.02, 0.98) to avoid very high/low noise level
 
         if self.noise_temp is None:
