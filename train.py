@@ -120,7 +120,7 @@ def prepare_embeddings(guidance_opt, guidance):
 
 def guidance_setup(guidance_opt):
     if guidance_opt.guidance=="SD":
-        from guidance.sd_utils import StableDiffusion
+        from guidance.sdxl_utils import StableDiffusion
         guidance = StableDiffusion(guidance_opt.g_device, guidance_opt.fp16, guidance_opt.vram_O, 
                                    guidance_opt.t_range, guidance_opt.max_t_range, 
                                    num_train_timesteps=guidance_opt.num_train_timesteps, 
@@ -261,12 +261,10 @@ def training(dataset, opt, pipe, gcams, guidance_opt, testing_iterations, saving
         if iteration > opt.inpaint_from:
             warm_up_rate = 1. - min(iteration/opt.warmup_iter,1.)
             guidance_scale = guidance_opt.guidance_scale
-            loss = guidance.train_step(torch.stack(text_z_, dim=1), images, mask_images,
-                                    pred_depth=depths, pred_alpha=alphas,
+            loss = guidance.train_step_xl(guidance_opt.text, guidance_opt.negative, images, mask_images,
                                     grad_scale=guidance_opt.lambda_guidance,
-                                    use_control_net = use_control_net ,save_folder = save_folder,  iteration = iteration, warm_up_rate=warm_up_rate, 
-                                    resolution=(gcams.image_h, gcams.image_w),
-                                    guidance_opt=guidance_opt,as_latent=False, embedding_inverse = text_z_inverse)
+                                    warm_up_rate=warm_up_rate, 
+                                    guidance_opt=guidance_opt)
             #raise ValueError(f'original version not supported.')
             scales = torch.stack(scales, dim=0)
 

@@ -1,7 +1,7 @@
 import torch
 from PIL import Image
 import numpy as np
-from diffusers import StableDiffusionInpaintPipeline
+from diffusers import StableDiffusionXLInpaintPipeline
 
 def load_image(image_path):
     return Image.open(image_path).convert("RGB")
@@ -24,8 +24,8 @@ def run_inpainting(pipe, image, mask, prompt=""):
 if __name__ == "__main__":
     # Load the model
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    pipe = StableDiffusionInpaintPipeline.from_pretrained(
-        "runwayml/stable-diffusion-inpainting",
+    pipe = StableDiffusionXLInpaintPipeline.from_pretrained(
+        "diffusers/stable-diffusion-xl-1.0-inpainting-0.1",
         torch_dtype=torch.float16
     )
     pipe.to(device)
@@ -38,6 +38,7 @@ if __name__ == "__main__":
 
     # Set a prompt for inpainting
     prompt = "A monkey"
+    negative_prompt = "hi hi"
 
     # Run inpainting
     inpainted_image = run_inpainting(pipe, image, mask, prompt)

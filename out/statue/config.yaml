@@ -14,7 +14,7 @@ ModelParams:
   
 
 GuidanceParams:
-  model_key: 'runwayml/stable-diffusion-inpainting'
+  model_key: "diffusers/stable-diffusion-xl-1.0-inpainting-0.1"
   text: 'A Monkey'
   negative: 'unrealistic, blurry, low quality, out of focus, ugly, low contrast, dull, dark, low-resolution, oversaturation.'
   inverse_text: ''

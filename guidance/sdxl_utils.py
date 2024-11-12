@@ -2,7 +2,7 @@ from audioop import mul
 from transformers import CLIPTextModel, CLIPTokenizer, logging
 from diffusers import StableDiffusionPipeline, StableDiffusionInpaintPipeline, DiffusionPipeline, DDPMScheduler, DDIMScheduler, EulerDiscreteScheduler, \
                       EulerAncestralDiscreteScheduler, DPMSolverMultistepScheduler, ControlNetModel, \
-                      DDIMInverseScheduler, UNet2DConditionModel
+                      DDIMInverseScheduler, UNet2DConditionModel, StableDiffusionXLInpaintPipeline
 from diffusers.utils.import_utils import is_xformers_available
 from os.path import isfile
 from pathlib import Path
@@ -24,81 +24,14 @@ from .perpneg_utils import weighted_perpendicular_aggregator
 
 from .sd_step import *
 
-def prepare_mask_and_masked_image(image, mask):
-    if isinstance(image, torch.Tensor):
-        if not isinstance(mask, torch.Tensor):
-            raise TypeError(f"`image` is a torch.Tensor but `mask` (type: {type(mask)} is not")
-
-        # Batch single image
-        if image.ndim == 3:
-            assert image.shape[0] == 3, "Image outside a batch should be of shape (3, H, W)"
-            image = image.unsqueeze(0)
-
-        # Batch and add channel dim for single mask
-        if mask.ndim == 2:
-            mask = mask.unsqueeze(0).unsqueeze(0)
-
-        # Batch single mask or add channel dim
-        if mask.ndim == 3:
-            # Single batched mask, no channel dim or single mask not batched but channel dim
-            if mask.shape[0] == 1:
-                mask = mask.unsqueeze(0)
-
-            # Batched masks no channel dim
-            else:
-                mask = mask.unsqueeze(1)
-                
-        assert image.ndim == 4 and mask.ndim == 4, "Image and Mask must have 4 dimensions"
-        assert image.shape[-2:] == mask.shape[-2:], "Image and Mask must have the same spatial dimensions"
-        assert image.shape[0] == mask.shape[0], "Image and Mask must have the same batch size"
-
-        # Check image is in [-1, 1]
-        if image.min() < -1 or image.max() > 1:
-            raise ValueError("Image should be in [-1, 1] range")
-
-        # Check mask is in [0, 1]
-        if mask.min() < 0 or mask.max() > 1:
-            raise ValueError("Mask should be in [0, 1] range")
-
-        # Binarize mask
-        mask[mask < 0.5] = 0
-        mask[mask >= 0.5] = 1
-
-        # Image as float32
-        image = image.to(dtype=torch.float32)
-    elif isinstance(mask, torch.Tensor):
-        raise TypeError(f"`mask` is a torch.Tensor but `image` (type: {type(image)} is not")
-    else:
-        # preprocess image
-        if isinstance(image, (PIL.Image.Image, np.ndarray)):
-            image = [image]
-
-        if isinstance(image, list) and isinstance(image[0], PIL.Image.Image):
-            image = [np.array(i.convert("RGB"))[None, :] for i in image]
-            image = np.concatenate(image, axis=0)
-        elif isinstance(image, list) and isinstance(image[0], np.ndarray):
-            image = np.concatenate([i[None, :] for i in image], axis=0)
-
-        image = image.transpose(0, 3, 1, 2)
-        image = torch.from_numpy(image).to(dtype=torch.float32) / 127.5 - 1.0
-
-        # preprocess mask
-        if isinstance(mask, (PIL.Image.Image, np.ndarray)):
-            mask = [mask]
-
-        if isinstance(mask, list) and isinstance(mask[0], PIL.Image.Image):
-            mask = np.concatenate([np.array(m.convert("L"))[None, None, :] for m in mask], axis=0)
-            mask = mask.astype(np.float32) / 255.0
-        elif isinstance(mask, list) and isinstance(mask[0], np.ndarray):
-            mask = np.concatenate([m[None, None, :] for m in mask], axis=0)
-
-        mask[mask < 0.5] = 0
-        mask[mask >= 0.5] = 1
-        mask = torch.from_numpy(mask)
-
-    masked_image = image * (mask < 0.5)
-
-    return mask, masked_image
+def rescale_noise_cfg(noise_cfg, noise_pred_text, guidance_rescale=0.0):
+    std_text = noise_pred_text.std(dim=list(range(1, noise_pred_text.ndim)), keepdim=True)
+    std_cfg = noise_cfg.std(dim=list(range(1, noise_cfg.ndim)), keepdim=True)
+    # rescale the results from guidance (fixes overexposure)
+    noise_pred_rescaled = noise_cfg * (std_text / std_cfg)
+    # mix with the original results from guidance by factor guidance_rescale to avoid "plain looking" images
+    noise_cfg = guidance_rescale * noise_pred_rescaled + (1 - guidance_rescale) * noise_cfg
+    return noise_cfg
 
 def rgb2sat(img, T=None):
     max_ = torch.max(img, dim=1, keepdim=True).values + 1e-5
@@ -147,9 +80,9 @@ class StableDiffusion(nn.Module):
         base_model_key = "stabilityai/stable-diffusion-v1-5" if guidance_opt.base_model_key is None else guidance_opt.base_model_key # for finetuned model only
 
         if is_safe_tensor:
-            pipe = StableDiffusionInpaintPipeline.from_single_file(model_key, use_safetensors=True, torch_dtype=self.precision_t, load_safety_checker=False)
+            pipe = StableDiffusionXLInpaintPipeline.from_single_file(model_key, use_safetensors=True, torch_dtype=self.precision_t, load_safety_checker=False)
         else:
-            pipe = StableDiffusionInpaintPipeline.from_pretrained(model_key, torch_dtype=self.precision_t)
+            pipe = StableDiffusionXLInpaintPipeline.from_pretrained(model_key, torch_dtype=self.precision_t)
 
         self.ism = not guidance_opt.sds
         self.scheduler = DDIMScheduler.from_pretrained(model_key if not is_safe_tensor else base_model_key, subfolder="scheduler", torch_dtype=self.precision_t)
@@ -203,6 +136,7 @@ class StableDiffusion(nn.Module):
         self.noise_temp = None
         self.noise_gen = torch.Generator(self.device)
         self.noise_gen.manual_seed(guidance_opt.noise_seed)
+        self.generator = self.noise_gen
 
         self.alphas = self.scheduler.alphas_cumprod.to(self.device) # for convenience
         self.rgb_latent_factors = torch.tensor([
@@ -237,11 +171,8 @@ class StableDiffusion(nn.Module):
                            text_embeddings=None, cfg=1.0, 
                            delta_t=1, inv_steps=1,
                            is_noisy_latent=False,
-                           eta=0.0):
-
-        text_embeddings = text_embeddings.to(self.precision_t)
-        if cfg <= 1.0:
-            uncond_text_embedding = text_embeddings.reshape(2, -1, text_embeddings.shape[-2], text_embeddings.shape[-1])[1]
+                           eta=0.0,
+                           added_cond_kwargs=None):
 
         unet = self.unet
         if is_noisy_latent:
@@ -256,33 +187,38 @@ class StableDiffusion(nn.Module):
 
         for i in range(inv_steps):
             # pred noise
-            cur_noisy_lat_ = self.scheduler.scale_model_input(cur_noisy_lat, self.timesteps[cur_ind_t]).to(self.precision_t)
+            cur_noisy_lat_ = torch.cat([cur_noisy_lat] * 2) if self.do_classifier_free_guidance else cur_noisy_lat
+            cur_noisy_lat_ = self.scheduler.scale_model_input(cur_noisy_lat_, self.timesteps[cur_ind_t]).to(self.precision_t)
             
-            if unet.config.in_channels == 9:
-                cur_noisy_lat_ = torch.cat([cur_noisy_lat_, mask, mask_img], dim=1)
-                timestep_model_input = self.timesteps[cur_ind_t].reshape(1, 1).repeat(cur_noisy_lat_.shape[0], 1).reshape(-1)
-                unet_output = unet(cur_noisy_lat_, timestep_model_input, 
-                                    encoder_hidden_states=uncond_text_embedding).sample
-            else:
-                timestep_model_input = self.timesteps[cur_ind_t].reshape(1, 1).repeat(cur_noisy_lat_.shape[0], 1).reshape(-1)
-                unet_output = unet(cur_noisy_lat_, timestep_model_input, 
-                                    encoder_hidden_states=uncond_text_embedding).sample
-                
-            pred_scores.append((cur_ind_t, unet_output))
+            cur_noisy_lat_ = torch.cat([cur_noisy_lat_, mask, mask_img], dim=1)
+
+            timestep_model_input = self.timesteps[cur_ind_t].reshape(1, 1).repeat(cur_noisy_lat_.shape[0], 1).reshape(-1)
+
+            unet_output = unet(cur_noisy_lat_, 
+                            timestep_model_input, 
+                            encoder_hidden_states=text_embeddings,
+                            added_cond_kwargs=added_cond_kwargs,
+                            ).sample
+            # perform guidance
+            if self.do_classifier_free_guidance:
+                noise_pred_uncond, noise_pred_text = unet_output.chunk(2)
+                noise_pred = noise_pred_uncond + 7.5 * (noise_pred_text - noise_pred_uncond)
+           
+            pred_scores.append((cur_ind_t, noise_pred))
 
             next_ind_t = min(cur_ind_t + delta_t, ind_t)
             cur_t, next_t = self.timesteps[cur_ind_t], self.timesteps[next_ind_t]
             delta_t_ = next_t-cur_t if isinstance(self.scheduler, DDIMScheduler) else next_ind_t-cur_ind_t
 
-            cur_noisy_lat = self.sche_func(self.scheduler, unet_output, cur_t, cur_noisy_lat, -delta_t_, eta).prev_sample
+            cur_noisy_lat = self.sche_func(self.scheduler, noise_pred, cur_t, cur_noisy_lat, -delta_t_, eta).prev_sample
             cur_ind_t = next_ind_t
 
-            del unet_output
+            del noise_pred
             torch.cuda.empty_cache()
 
             if cur_ind_t == ind_t:
                 break
-
+            
         return prev_noisy_lat, cur_noisy_lat, pred_scores[::-1]
 
 
@@ -299,7 +235,7 @@ class StableDiffusion(nn.Module):
         # we do that before converting to dtype to avoid breaking in case we're using cpu_offload
         # and half precision
         mask = torch.nn.functional.interpolate(
-            mask, size=(height, width)
+            mask, size=(height//self.pipe.vae_scale_factor, width//self.pipe.vae_scale_factor)
         )
         mask = mask.to(device=device, dtype=dtype)
 
@@ -343,59 +279,72 @@ class StableDiffusion(nn.Module):
         masked_image_latents = masked_image_latents.to(device=device, dtype=dtype)
         return mask, masked_image_latents
 
-
-    def train_step(self, text_embeddings, pred_rgb, mask_image, pred_depth=None, pred_alpha=None,
-                    grad_scale=1,use_control_net=False,
-                    save_folder:Path=None, iteration=0, warm_up_rate = 0,
-                    resolution=(512, 512), guidance_opt=None,as_latent=False, embedding_inverse = None):
-        origin = (pred_rgb * (1-mask_image)).detach()
-        masked_pred_rgb = pred_rgb * mask_image.clone() + origin
+    def train_step_xl(self, prompt, negative_prompt, image, mask_image,
+                    grad_scale=1, warm_up_rate = 0,
+                    resolution=(1024, 1024), guidance_opt=None):
         
-        # pred_rgb, pred_depth, pred_alpha = self.augmentation(pred_rgb, pred_depth, pred_alpha)
-        mask, masked_image = prepare_mask_and_masked_image(masked_pred_rgb, mask_image)
-        B = masked_pred_rgb.shape[0]
-        K = text_embeddings.shape[0] - 1
-
-        if as_latent:      
-            latents,_ = self.encode_imgs(pred_depth.repeat(1,3,1,1).to(self.precision_t))
-        else:
-            latents,_ = self.encode_imgs(masked_pred_rgb.to(self.precision_t))
-        # timestep ~ U(0.02, 0.98) to avoid very high/low noise level
-
-        if self.noise_temp is None:
-            self.noise_temp = torch.randn((latents.shape[0], 4, resolution[0] // 8, resolution[1] // 8, ), dtype=latents.dtype, device=latents.device, generator=self.noise_gen) + 0.1 * torch.randn((1, 4, 1, 1), device=latents.device).repeat(latents.shape[0], 1, 1, 1)
+        # origin = (pred_rgb * (1-mask_image)).detach()
+        # masked_pred_rgb = pred_rgb * mask_image.clone() + origin
+        height = resolution[0]
+        width = resolution[1]
+        batch_size = 1
+        device = self.device
         
-        if guidance_opt.fix_noise:
-            noise = self.noise_temp
-        else:
-            noise = torch.randn((latents.shape[0], 4, resolution[0] // 8, resolution[1] // 8, ), dtype=latents.dtype, device=latents.device, generator=self.noise_gen) + 0.1 * torch.randn((1, 4, 1, 1), device=latents.device).repeat(latents.shape[0], 1, 1, 1)
+        self.do_classifier_free_guidance = True
 
-        text_embeddings = text_embeddings[:, :, ...]
-        text_embeddings = text_embeddings.reshape(-1, text_embeddings.shape[-2], text_embeddings.shape[-1]) # make it k+1, c * t, ...
-
-        inverse_text_embeddings = embedding_inverse.unsqueeze(1).repeat(1, B, 1, 1).reshape(-1, embedding_inverse.shape[-2], embedding_inverse.shape[-1])
-
+        (
+            prompt_embeds,
+            negative_prompt_embeds,
+            pooled_prompt_embeds,
+            negative_pooled_prompt_embeds,
+        ) = self.pipe.encode_prompt(
+            prompt=prompt,
+            device=self.device,
+            do_classifier_free_guidance=self.do_classifier_free_guidance,
+            negative_prompt=negative_prompt,
+        )
+        
+        
+        ## Time step setup
         if guidance_opt.annealing_intervals:
             current_delta_t =  int(guidance_opt.delta_t + (warm_up_rate)*(guidance_opt.delta_t_start - guidance_opt.delta_t))
         else:
             current_delta_t =  guidance_opt.delta_t
 
         ind_t = torch.randint(self.min_step, self.max_step + int(self.warmup_step*warm_up_rate), (1, ), dtype=torch.long, generator=self.noise_gen, device=self.device)[0]
-        ind_prev_t = max(ind_t - current_delta_t, torch.ones_like(ind_t) * 0)
+        ind_prev_t = max(ind_t - current_delta_t, torch.ones_like(ind_t) * 0)   
+             
+        ## Prepare image and mask
+        original_image = image
+        init_image = self.pipe.image_processor.preprocess(
+            image, height=height, width=width, crops_coords=None, resize_mode="default")
+        init_image = init_image.to(dtype=torch.float16)
+        
+        mask = self.pipe.image_processor.preprocess(
+            mask_image, height=height, width=width, crops_coords=None, resize_mode="default")
+        
+        masked_image = init_image * (mask < 0.5)    
+        
+        num_channels_latents = self.vae.config.latent_channels
+        num_channels_unet = self.unet.config.in_channels
+        return_image_latents = num_channels_unet == 4 
+        
+        ## Prepare latent and noise
+        latents = self.pipe._encode_vae_image(init_image, generator=self.noise_gen)
+        shape = (latents.shape)
+        noise = torch.randn(shape, dtype=latents.dtype, device=latents.device, generator=self.noise_gen)
         
         mask, masked_image_latents = self.prepare_mask_latents(
             mask,
             masked_image,
-            latents.shape[0],
-            resolution[0] // 8,
-            resolution[1] // 8,
-            latents.dtype,
-            latents.device,
-            generator=self.noise_gen,
-            do_classifier_free_guidance=False,
-        )    
-        num_channels_latents = self.vae.config.latent_channels
-        
+            batch_size,
+            height,
+            width,
+            prompt_embeds.dtype,
+            device,
+            self.generator,
+            self.do_classifier_free_guidance,
+        )  
         # Check that sizes of mask, masked image and latents match
         num_channels_mask = mask.shape[1]
         num_channels_masked_image = masked_image_latents.shape[1]
@@ -407,56 +356,90 @@ class StableDiffusion(nn.Module):
                 f" = {num_channels_latents+num_channels_masked_image+num_channels_mask}. Please verify the config of"
                 " `pipeline.unet` or your `mask_image` or `image` input."
             )
+            
+        height, width = latents.shape[-2:]
+        height = height * self.pipe.vae_scale_factor
+        width = width * self.pipe.vae_scale_factor
 
+        original_size = (height, width)
+        target_size = (height, width)
+
+        # 10. Prepare added time ids & embeddings
+        negative_original_size = original_size
+        negative_target_size = target_size
+
+        add_text_embeds = pooled_prompt_embeds
+        if self.pipe.text_encoder_2 is None:
+            text_encoder_projection_dim = int(pooled_prompt_embeds.shape[-1])
+        else:
+            text_encoder_projection_dim = self.pipe.text_encoder_2.config.projection_dim
+
+        add_time_ids, add_neg_time_ids = self.pipe._get_add_time_ids(
+            original_size,
+            (0,0),
+            target_size,
+            6.0,
+            2.5,
+            negative_original_size,
+            (0,0),
+            negative_target_size,
+            dtype=prompt_embeds.dtype,
+            text_encoder_projection_dim=text_encoder_projection_dim,
+        )
+        
+        if self.do_classifier_free_guidance:
+            prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
+            add_text_embeds = torch.cat([negative_pooled_prompt_embeds, add_text_embeds], dim=0)
+            add_time_ids = torch.cat([add_neg_time_ids, add_time_ids], dim=0)
+        
+        prompt_embeds = prompt_embeds.to(self.device)
+        add_text_embeds = add_text_embeds.to(self.device)
+        add_time_ids = add_time_ids.to(self.device)
+        
+        added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
+        
         t = self.timesteps[ind_t]
         prev_t = self.timesteps[ind_prev_t]
 
         with torch.no_grad():
-            # step unroll via ddim inversion
-            if not self.ism:
-                prev_latents_noisy = self.scheduler.add_noise(latents, noise, prev_t)
-                latents_noisy = self.scheduler.add_noise(latents, noise, t)
-                target = noise
-            else:
-                # Step 1: sample x_s with larger steps
-                xs_delta_t = guidance_opt.xs_delta_t if guidance_opt.xs_delta_t is not None else current_delta_t
-                xs_inv_steps = guidance_opt.xs_inv_steps if guidance_opt.xs_inv_steps is not None else int(np.ceil(ind_prev_t / xs_delta_t))
-                starting_ind = max(ind_prev_t - xs_delta_t * xs_inv_steps, torch.ones_like(ind_t) * 0)
+            # Step 1: sample x_s with larger steps
+            xs_delta_t = guidance_opt.xs_delta_t if guidance_opt.xs_delta_t is not None else current_delta_t
+            xs_inv_steps = guidance_opt.xs_inv_steps if guidance_opt.xs_inv_steps is not None else int(np.ceil(ind_prev_t / xs_delta_t))
+            starting_ind = max(ind_prev_t - xs_delta_t * xs_inv_steps, torch.ones_like(ind_t) * 0)
 
-                _, prev_latents_noisy, pred_scores_xs = self.add_noise_with_cfg(latents, mask, masked_image_latents, noise, ind_prev_t, starting_ind, inverse_text_embeddings, 
-                                                                                guidance_opt.denoise_guidance_scale, xs_delta_t, xs_inv_steps, eta=guidance_opt.xs_eta)
-                # Step 2: sample x_t
-                _, latents_noisy, pred_scores_xt = self.add_noise_with_cfg(prev_latents_noisy, mask, masked_image_latents, noise, ind_t, ind_prev_t, inverse_text_embeddings, 
-                                                                           guidance_opt.denoise_guidance_scale, current_delta_t, 1, is_noisy_latent=True)        
+            ## To Unet
+            _, prev_latents_noisy, pred_scores_xs = self.add_noise_with_cfg(latents, mask, masked_image_latents, noise, ind_prev_t, starting_ind, prompt_embeds, 
+                                                                            guidance_opt.denoise_guidance_scale, xs_delta_t, xs_inv_steps, eta=guidance_opt.xs_eta, 
+                                                                            added_cond_kwargs=added_cond_kwargs)
+            # Step 2: sample x_t
+            _, latents_noisy, pred_scores_xt = self.add_noise_with_cfg(prev_latents_noisy, mask, masked_image_latents, noise, ind_t, ind_prev_t, prompt_embeds, 
+                                                                        guidance_opt.denoise_guidance_scale, current_delta_t, 1, is_noisy_latent=True, 
+                                                                        added_cond_kwargs=added_cond_kwargs)        
 
-                pred_scores = pred_scores_xt + pred_scores_xs
-                target = pred_scores[0][1]
-
+            pred_scores = pred_scores_xt + pred_scores_xs
+            target = pred_scores[0][1]
+        
         with torch.no_grad():
-            latent_model_input = latents_noisy[None, :, ...].repeat(2, 1, 1, 1, 1).reshape(-1, 4, resolution[0] // 8, resolution[1] // 8, )
-            mask = mask.repeat(2, 1, 1, 1)
-            masked_image_latents = masked_image_latents.repeat(2, 1, 1, 1)
+            latent_model_input = torch.cat([latents] * 2) if self.do_classifier_free_guidance else latents
             tt = t.reshape(1, 1).repeat(latent_model_input.shape[0], 1).reshape(-1)
-
+            
             latent_model_input = self.scheduler.scale_model_input(latent_model_input, tt[0])
             latent_model_input = torch.cat([latent_model_input, mask, masked_image_latents], dim=1)
-
-            unet_output = self.unet(latent_model_input.to(self.precision_t), tt.to(self.precision_t), encoder_hidden_states=text_embeddings.to(self.precision_t)).sample
-
-            unet_output = unet_output.reshape(2, -1, 4, resolution[0] // 8, resolution[1] // 8, )
-            noise_pred_uncond, noise_pred_text = unet_output[:1].reshape(-1, 4, resolution[0] // 8, resolution[1] // 8, ), unet_output[1:].reshape(-1, 4, resolution[0] // 8, resolution[1] // 8, )
-            delta_DSD = noise_pred_text - noise_pred_uncond
-        
-
-        # Calculate the noise prediction and gradients
-        pred_noise = noise_pred_uncond + guidance_opt.guidance_scale * delta_DSD
+            unet_output = self.unet(latent_model_input.to(self.precision_t), 
+                                    tt.to(self.precision_t),
+                                    encoder_hidden_states=prompt_embeds,
+                                    added_cond_kwargs=added_cond_kwargs,
+                                    ).sample
+            if self.do_classifier_free_guidance:
+                noise_pred_uncond, noise_pred_text = unet_output.chunk(2)
+                noise_pred = noise_pred_uncond + 7.5 * (noise_pred_text - noise_pred_uncond) 
 
         # Define weighting function for the noise scaling
         w = lambda alphas: (((1 - alphas) / alphas) ** 0.5)
 
         # Only calculate the gradient for masked regions
         # grad will be zero in areas where mask is zero
-        grad = w(self.alphas[t]) * (pred_noise - target)
+        grad = w(self.alphas[t]) * (noise_pred - target)
 
         # Apply the mask to only calculate gradients in the masked region
         # Multiplying by mask ensures that only masked regions are affected
@@ -480,15 +463,3 @@ class StableDiffusion(nn.Module):
         imgs = (imgs / 2 + 0.5).clamp(0, 1)
 
         return imgs.to(target_dtype)
-
-    def encode_imgs(self, imgs):
-        target_dtype = imgs.dtype
-        # imgs: [B, 3, H, W]
-        imgs = 2 * imgs - 1
-
-        posterior = self.vae.encode(imgs.to(self.vae.dtype)).latent_dist
-        kl_divergence = posterior.kl()
-
-        latents = posterior.sample() * self.vae.config.scaling_factor
-
-        return latents.to(target_dtype), kl_divergence
