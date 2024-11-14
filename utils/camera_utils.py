@@ -22,6 +22,24 @@ WARNED = False
 def loadCam(args, id, cam_info, resolution_scale, is_nerf_synthetic, is_test_dataset):
     image = Image.open(cam_info.image_path)
     mask = Image.open(cam_info.mask_path)
+    
+    # Convert the mask to a numpy array for dilation
+    mask = np.array(mask)
+
+    # Check if the mask is grayscale (single channel) or needs conversion
+    if len(mask.shape) == 3 and mask.shape[2] > 1:
+        mask = cv2.cvtColor(mask, cv2.COLOR_RGB2GRAY)
+
+    # Define a kernel size for dilation
+    kernel_size = 15  # You can adjust the size depending on the dilation effect needed
+    kernel = np.ones((kernel_size, kernel_size), np.uint8)
+
+    # Apply dilation to the mask
+    dilated_mask = cv2.dilate(mask, kernel, iterations=1)
+
+    # Convert the dilated mask back to PIL image
+    mask = Image.fromarray(dilated_mask)
+
     if cam_info.depth_path != "":
         try:
             if is_nerf_synthetic:
@@ -60,7 +78,7 @@ def loadCam(args, id, cam_info, resolution_scale, is_nerf_synthetic, is_test_dat
     
 
         scale = float(global_down) * float(resolution_scale)
-        resolution = (1024, 1024)# (int(orig_w / scale), int(orig_h / scale))
+        resolution = (512, 512)# (int(orig_w / scale), int(orig_h / scale))
 
     return Camera(resolution, colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
                   FoVx=cam_info.FovX, FoVy=cam_info.FovY, depth_params=cam_info.depth_params,

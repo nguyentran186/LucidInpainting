@@ -14,8 +14,8 @@ ModelParams:
   
 
 GuidanceParams:
-  model_key: "diffusers/stable-diffusion-xl-1.0-inpainting-0.1"
-  text: 'A Monkey'
+  model_key: "runwayml/stable-diffusion-inpainting"
+  text: 'Fit to surrounding background'
   negative: 'unrealistic, blurry, low quality, out of focus, ugly, low contrast, dull, dark, low-resolution, oversaturation.'
   inverse_text: ''
   perpneg: false
@@ -73,6 +73,8 @@ OptimizationParams:
   progressive_view_iter: 500 #1500
   opacity_reset_interval: 3000 #500
   inpaint_from: 500
+  inpaint_interval: 50
+  inpaint_continuous_from: 1
 
   scale_up_cameras_iter: 500
   fovy_scale_up_factor: [0.75, 1.1]

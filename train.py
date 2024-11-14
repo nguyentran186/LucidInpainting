@@ -120,7 +120,7 @@ def prepare_embeddings(guidance_opt, guidance):
 
 def guidance_setup(guidance_opt):
     if guidance_opt.guidance=="SD":
-        from guidance.sdxl_utils import StableDiffusion
+        from guidance.sdm_utils import StableDiffusion
         guidance = StableDiffusion(guidance_opt.g_device, guidance_opt.fp16, guidance_opt.vram_O, 
                                    guidance_opt.t_range, guidance_opt.max_t_range, 
                                    num_train_timesteps=guidance_opt.num_train_timesteps, 
@@ -216,7 +216,7 @@ def training(dataset, opt, pipe, gcams, guidance_opt, testing_iterations, saving
         # Embedding negative prompt
         text_z_inverse =torch.cat([embeddings['uncond'],embeddings['inverse_text']], dim=0)
                 
-        mask_image = viewpoint_cam.mask_image.detach()
+        mask_image = viewpoint_cam.mask_image
             
         #pred text_z
         text_z = [embeddings['uncond']]
@@ -237,6 +237,9 @@ def training(dataset, opt, pipe, gcams, guidance_opt, testing_iterations, saving
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
         depth, alpha = render_pkg["depth"], render_pkg["alpha"]
         
+        gt_image = viewpoint_cam.original_image.cuda() 
+        masked_image = image * mask_image + gt_image * (1-mask_image)
+        
         if iteration % 10 == 0:
             # Convert tensor to PIL image
             to_pil = T.ToPILImage()
@@ -246,7 +249,7 @@ def training(dataset, opt, pipe, gcams, guidance_opt, testing_iterations, saving
             pil_image.save("temp.png")
 
         scales.append(render_pkg["scales"])
-        images.append(torch.clamp(image, min=0.0, max=1.0))
+        images.append(torch.clamp(masked_image, min=0.0, max=1.0))
         depths.append(depth)
         alphas.append(alpha)
         mask_images.append(mask_image)
@@ -258,13 +261,17 @@ def training(dataset, opt, pipe, gcams, guidance_opt, testing_iterations, saving
         mask_images = torch.stack(mask_images, dim=0)
         loss_inpaint = None
         # Loss
-        if iteration > opt.inpaint_from:
+        if iteration > opt.inpaint_continuous_from or (iteration > opt.inpaint_from and iteration % opt.inpaint_interval == 0):
             warm_up_rate = 1. - min(iteration/opt.warmup_iter,1.)
             guidance_scale = guidance_opt.guidance_scale
-            loss = guidance.train_step_xl(guidance_opt.text, guidance_opt.negative, images, mask_images,
+            
+            loss = guidance.train_step(torch.stack(text_z_, dim=1), images, mask_images,
+                                       guidance_opt.text, guidance_opt.negative,
+                                    pred_depth=depths, pred_alpha=alphas,
                                     grad_scale=guidance_opt.lambda_guidance,
-                                    warm_up_rate=warm_up_rate, 
-                                    guidance_opt=guidance_opt)
+                                    use_control_net = use_control_net ,save_folder = save_folder,  iteration = iteration, warm_up_rate=warm_up_rate, 
+                                    resolution=(gcams.image_h, gcams.image_w),
+                                    guidance_opt=guidance_opt,as_latent=False, embedding_inverse = text_z_inverse)
             #raise ValueError(f'original version not supported.')
             scales = torch.stack(scales, dim=0)
 

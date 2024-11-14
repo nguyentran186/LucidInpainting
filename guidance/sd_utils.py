@@ -194,7 +194,6 @@ class StableDiffusion(nn.Module):
         
         self.num_train_timesteps = num_train_timesteps if num_train_timesteps is not None else self.scheduler.config.num_train_timesteps        
         self.scheduler.set_timesteps(self.num_train_timesteps, device=device)
-
         self.timesteps = torch.flip(self.scheduler.timesteps, dims=(0, ))
         self.min_step = int(self.num_train_timesteps * t_range[0])
         self.max_step = int(self.num_train_timesteps * t_range[1])
@@ -251,7 +250,8 @@ class StableDiffusion(nn.Module):
 
         cur_ind_t = ind_prev_t
         cur_noisy_lat = prev_noisy_lat
-
+        init_latent = prev_noisy_lat.detach()
+        init_mask = mask.detach()
         pred_scores = []
 
         for i in range(inv_steps):
@@ -261,6 +261,7 @@ class StableDiffusion(nn.Module):
             if unet.config.in_channels == 9:
                 cur_noisy_lat_ = torch.cat([cur_noisy_lat_, mask, mask_img], dim=1)
                 timestep_model_input = self.timesteps[cur_ind_t].reshape(1, 1).repeat(cur_noisy_lat_.shape[0], 1).reshape(-1)
+                breakpoint()
                 unet_output = unet(cur_noisy_lat_, timestep_model_input, 
                                     encoder_hidden_states=uncond_text_embedding).sample
             else:
@@ -276,6 +277,7 @@ class StableDiffusion(nn.Module):
 
             cur_noisy_lat = self.sche_func(self.scheduler, unet_output, cur_t, cur_noisy_lat, -delta_t_, eta).prev_sample
             cur_ind_t = next_ind_t
+            cur_noisy_lat = init_latent * (1-init_mask) +  cur_noisy_lat * init_mask
 
             del unet_output
             torch.cuda.empty_cache()
@@ -348,6 +350,7 @@ class StableDiffusion(nn.Module):
                     grad_scale=1,use_control_net=False,
                     save_folder:Path=None, iteration=0, warm_up_rate = 0,
                     resolution=(512, 512), guidance_opt=None,as_latent=False, embedding_inverse = None):
+        
         origin = (pred_rgb * (1-mask_image)).detach()
         masked_pred_rgb = pred_rgb * mask_image.clone() + origin
         
@@ -369,7 +372,7 @@ class StableDiffusion(nn.Module):
             noise = self.noise_temp
         else:
             noise = torch.randn((latents.shape[0], 4, resolution[0] // 8, resolution[1] // 8, ), dtype=latents.dtype, device=latents.device, generator=self.noise_gen) + 0.1 * torch.randn((1, 4, 1, 1), device=latents.device).repeat(latents.shape[0], 1, 1, 1)
-
+        
         text_embeddings = text_embeddings[:, :, ...]
         text_embeddings = text_embeddings.reshape(-1, text_embeddings.shape[-2], text_embeddings.shape[-1]) # make it k+1, c * t, ...
 
@@ -463,7 +466,7 @@ class StableDiffusion(nn.Module):
         masked_grad = grad * mask.chunk(2)[0]  # Use the mask chunk for the input batch
 
         # Scale gradients as needed, and handle NaN values
-        masked_grad = torch.nan_to_num(grad_scale * masked_grad)
+        masked_grad = torch.nan_to_num(grad_scale * grad)
 
         # Create the loss with SpecifyGradient but only apply masked_grad
         # This will effectively ignore non-masked regions in backpropagation
